@@ -2,17 +2,16 @@
 
 Commands:
 - /start - menu & help
-- /scam or /scan - multi-pair scanner (cari high-prob setup)
+- /scan - multi-pair scanner (cari high-prob setup)
 - /analyze SYMBOL TF - analisa single pair (e.g. /analyze GBPUSD M5)
 - /news - high-impact news hari ini
 - /killzone - cek session/killzone saat ini
-- /register - info VIP
+- /pairs - list pair didukung
 - Natural input: "GBPUSD M5" juga bisa
 """
 
 import os
 import logging
-from datetime import datetime, timezone
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
@@ -32,25 +31,6 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO
 )
 log = logging.getLogger("forex-bot")
-
-# Trial counter
-TRIAL = {}  # user_id -> {"count": int, "date": str}
-
-
-def check_trial(user_id: int) -> tuple[bool, str]:
-    """Check daily trial limit. Returns (allowed, msg)."""
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    if user_id not in TRIAL:
-        TRIAL[user_id] = {"count": 0, "date": today}
-    info = TRIAL[user_id]
-    if info["date"] != today:
-        info["count"] = 0
-        info["date"] = today
-    if info["count"] >= 5:
-        return False, "⛔ Trial harian: 5 analisa. Reset besok. Upgrade VIP → /register"
-    info["count"] += 1
-    remaining = 5 - info["count"]
-    return True, f"({info['count']}/5 hari ini, sisa {remaining})"
 
 
 # === Handlers ===
@@ -81,9 +61,7 @@ ICT/SMC + Multi-TF + News Filter + Session Filter
 5. ADX > 20 (trending)
 
 Skor minimal <b>7/10</b> → entry layak
-Di bawah 7 → <b>SKIP</b> (ini yang membedakan high-prob vs gambling)
-
-🕒 Trial: 5 analisa/hari. VIP: unlimited → /register"""
+Di bawah 7 → <b>SKIP</b> (ini yang membedakan high-prob vs gambling)"""
     await update.message.reply_text(text, parse_mode="HTML")
 
 
@@ -97,7 +75,6 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /news - high-impact news hari ini
 /kz - cek session/killzone saat ini
 /pairs - list pair yang didukung
-/register - info VIP
 
 <b>Natural input:</b> Ketik <code>SYMBOL TF</code> langsung
 Contoh: <code>GBPUSD M5</code>, <code>USDJPY M15</code>
@@ -170,14 +147,8 @@ async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    allowed, trial_msg = check_trial(user_id)
-    if not allowed:
-        await update.message.reply_text(trial_msg)
-        return
-
     status_msg = await update.message.reply_text(
-        f"⏳ Scanning {len(DEFAULT_SCAN_PAIRS)} pairs untuk high-prob setup... {trial_msg}"
+        f"⏳ Scanning {len(DEFAULT_SCAN_PAIRS)} pairs untuk high-prob setup..."
     )
     try:
         results = scan_pairs(TWELVEDATA_API_KEY, DEFAULT_SCAN_PAIRS)
@@ -186,14 +157,13 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text = "❌ Tidak ada setup high-probability sekarang.\n\n"
             text += "Coba lagi saat killzone (London 01-04 UTC atau NY 08-11 UTC)."
         else:
-            text += f"\n<i>Scanned {len(DEFAULT_SCAN_PAIRS)} pairs · {trial_msg}</i>"
+            text += f"\n<i>Scanned {len(DEFAULT_SCAN_PAIRS)} pairs</i>"
     except Exception as e:
         text = f"❌ Error scan: {e}"
     await status_msg.edit_text(text, parse_mode="HTML")
 
 
 async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
     args = context.args
     if not args:
         await update.message.reply_text(
@@ -201,11 +171,6 @@ async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Contoh: <code>/analyze GBPUSD M5</code>",
             parse_mode="HTML"
         )
-        return
-
-    allowed, trial_msg = check_trial(user_id)
-    if not allowed:
-        await update.message.reply_text(trial_msg)
         return
 
     text_input = " ".join(args)
@@ -220,23 +185,13 @@ async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     symbol, tf = parsed
     status_msg = await update.message.reply_text(
-        f"⏳ Menganalisa {symbol} {tf}... {trial_msg}"
+        f"⏳ Menganalisa {symbol} {tf}..."
     )
     try:
         text = quick_analyze(TWELVEDATA_API_KEY, symbol, tf)
     except Exception as e:
         text = f"❌ Error: {e}"
     await status_msg.edit_text(text, parse_mode="HTML")
-
-
-async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "💎 <b>VIP Akses</b>\n\n"
-        "Trial gratis: 5 analisa/hari\n"
-        "VIP: unlimited analisa + alert scanner otomatis\n\n"
-        "Hubungi admin @admin untuk upgrade.",
-        parse_mode="HTML"
-    )
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -251,15 +206,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    user_id = update.effective_user.id
-    allowed, trial_msg = check_trial(user_id)
-    if not allowed:
-        await update.message.reply_text(trial_msg)
-        return
-
     symbol, tf = parsed
     status_msg = await update.message.reply_text(
-        f"⏳ Menganalisa {symbol} {tf}... {trial_msg}"
+        f"⏳ Menganalisa {symbol} {tf}..."
     )
     try:
         result = quick_analyze(TWELVEDATA_API_KEY, symbol, tf)
@@ -284,7 +233,6 @@ def main():
     app.add_handler(CommandHandler("scan", cmd_scan))
     app.add_handler(CommandHandler("scam", cmd_scan))  # typo alias
     app.add_handler(CommandHandler("analyze", cmd_analyze))
-    app.add_handler(CommandHandler("register", cmd_register))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_error_handler(on_error)
     log.info("Forex bot berjalan...")
