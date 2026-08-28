@@ -21,6 +21,15 @@ from fundamental import (
     calc_currency_strength, strength_label, strength_emoji,
     get_pair_interest_diff, format_fundamental_block,
 )
+from indicators import (
+    compute_rsi, detect_rsi_divergence, rsi_signal,
+    compute_macd, macd_signal,
+    compute_bollinger, bollinger_signal, detect_bb_squeeze,
+    compute_stoch_rsi, stoch_rsi_signal,
+    compute_vwap, vwap_signal,
+    compute_atr, atr_percent,
+    multi_indicator_confluence,
+)
 
 # === SYMBOL MAP ===
 SYMBOL_MAP = {
@@ -549,6 +558,46 @@ def analyze_full(api_key: str, symbol: str, timeframe: str = "M5") -> dict:
     session = get_session()
     in_news, news_event = is_news_window()
 
+    # === TECHNICAL INDICATORS (M15 timeframe untuk konfirmasi) ===
+    rsi_series = compute_rsi(df_m15["close"], 14)
+    rsi_val = float(rsi_series.iloc[-1])
+    rsi_div = detect_rsi_divergence(df_m15["close"], rsi_series, 50)
+    rsi_sig = rsi_signal(rsi_val)
+
+    macd_data = compute_macd(df_m15["close"])
+    hist_now = float(macd_data["histogram"].iloc[-1])
+    hist_prev = float(macd_data["histogram"].iloc[-2])
+    macd_sig = macd_signal(hist_now, hist_prev)
+
+    bb_data = compute_bollinger(df_m15["close"], 20, 2.0)
+    bb_sig = bollinger_signal(price, bb_data)
+    bb_squeeze = detect_bb_squeeze(bb_data, 0.05)
+
+    stoch_data = compute_stoch_rsi(df_m15["close"])
+    k_now = float(stoch_data["k"].iloc[-1])
+    d_now = float(stoch_data["d"].iloc[-1])
+    k_prev = float(stoch_data["k"].iloc[-2])
+    d_prev = float(stoch_data["d"].iloc[-2])
+    stoch_sig = stoch_rsi_signal(k_now, d_now, k_prev, d_prev)
+
+    vwap_series = compute_vwap(df_m15)
+    vwap_val = float(vwap_series.iloc[-1]) if not vwap_series.empty else price
+    vwap_sig = vwap_signal(price, vwap_val)
+
+    atr_series = compute_atr(df_m15)
+    atr_val = float(atr_series.iloc[-1])
+    atr_pct = atr_percent(price, atr_val)
+
+    confluence = multi_indicator_confluence(
+        rsi_val=rsi_val,
+        rsi_div=rsi_div,
+        macd_sig=macd_sig,
+        stoch_sig=stoch_sig,
+        bb_sig=bb_sig,
+        vwap_sig=vwap_sig,
+        adx=adx,
+    )
+
     # Score
     score_info = score_setup(
         h4_trend=h4_trend,
@@ -560,6 +609,18 @@ def analyze_full(api_key: str, symbol: str, timeframe: str = "M5") -> dict:
         adx=adx,
         in_news=in_news,
     )
+
+    # Boost score jika multi-indicator confluence tinggi
+    ind_score = confluence["score"]  # 0-6
+    if ind_score >= 4 and signal in ("BUY", "SELL"):
+        # Cek direction confluence
+        if signal == "BUY" and confluence["bullish_count"] >= 4:
+            score_info["score"] = min(10, score_info["score"] + 1)
+            score_info["breakdown"].append(f"✓ Multi-indikator bullish ({confluence['bullish_count']}/6) (+1)")
+        elif signal == "SELL" and confluence["bearish_count"] >= 4:
+            score_info["score"] = min(10, score_info["score"] + 1)
+            score_info["breakdown"].append(f"✓ Multi-indikator bearish ({confluence['bearish_count']}/6) (+1)")
+    score_info["high_prob"] = score_info["score"] >= 7
 
     # Skip reasons
     skip_reasons = []
@@ -587,6 +648,22 @@ def analyze_full(api_key: str, symbol: str, timeframe: str = "M5") -> dict:
         "score": score_info["score"], "score_breakdown": score_info["breakdown"],
         "high_prob": score_info["high_prob"],
         "skip_reasons": skip_reasons,
+        # Technical indicators
+        "tech": {
+            "rsi": rsi_val,
+            "rsi_signal": rsi_sig,
+            "rsi_div": rsi_div,
+            "macd": macd_sig,
+            "macd_hist": hist_now,
+            "bb": bb_sig,
+            "bb_squeeze": bb_squeeze,
+            "stoch_rsi": stoch_sig,
+            "vwap": vwap_sig,
+            "vwap_val": vwap_val,
+            "atr": atr_val,
+            "atr_pct": atr_pct,
+            "confluence": confluence,
+        },
     }
 
 
@@ -633,6 +710,43 @@ def format_analysis(result: dict) -> str:
 • Harga <b>{p:.2f}</b> · zona {zona}
 • Range: {p*0.997:.2f} – {p*1.003:.2f}
 • Likuiditas: {'resting di BSL' if result['signal'] != 'BUY' else 'resting di SSL'}
+
+"""
+
+    # === TECHNICAL INDICATORS (M15) ===
+    if "tech" in result:
+        t = result["tech"]
+        # Build RSI signal line
+        rsi_emoji = "🟢" if t["rsi_signal"] in ("oversold", "bullish") else "🔴" if t["rsi_signal"] in ("overbought", "bearish") else "⚪"
+        # MACD signal
+        macd_emoji = "🟢" if "bullish" in t["macd"] else "🔴" if "bearish" in t["macd"] else "⚪"
+        # Bollinger
+        bb_emoji = "🟢" if t["bb"] == "oversold" else "🔴" if t["bb"] == "overbought" else "⚪"
+        # Stoch RSI
+        stoch_emoji = "🟢" if t["stoch_rsi"] in ("oversold", "bullish_cross") else "🔴" if t["stoch_rsi"] in ("overbought", "bearish_cross") else "⚪"
+        # VWAP
+        vwap_emoji = "🟢" if t["vwap"] == "above" else "🔴" if t["vwap"] == "below" else "⚪"
+        # Confluence
+        cf = t["confluence"]
+        if cf["bullish_count"] > cf["bearish_count"]:
+            conf_emoji = f"🟢 {cf['bullish_count']}/{cf['total']} bullish"
+        elif cf["bearish_count"] > cf["bullish_count"]:
+            conf_emoji = f"🔴 {cf['bearish_count']}/{cf['total']} bearish"
+        else:
+            conf_emoji = f"⚪ mixed {cf['bullish_count']}/{cf['bearish_count']}"
+
+        div_text = ""
+        if t["rsi_div"] != "none":
+            div_text = f"\n• Divergence: <b>{t['rsi_div']}</b> (strong signal)"
+
+        text += f"""📈 <b>TECHNICAL INDICATORS (M15)</b>
+• RSI(14): {rsi_emoji} {t['rsi']:.1f} ({t['rsi_signal']}){div_text}
+• MACD: {macd_emoji} {t['macd']} (hist: {t['macd_hist']:+.3f})
+• Bollinger: {bb_emoji} {t['bb']}{' | SQUEEZE detected' if t['bb_squeeze'] else ''}
+• Stoch RSI: {stoch_emoji} {t['stoch_rsi']}
+• VWAP: {vwap_emoji} {t['vwap']} ({t['vwap_val']:.2f})
+• ATR(14): {t['atr']:.2f} ({t['atr_pct']:.2f}% of price)
+• Confluence: {conf_emoji}
 
 """
 
