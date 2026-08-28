@@ -18,8 +18,13 @@ from telegram.ext import Application, CommandHandler, MessageHandler, ContextTyp
 
 from analysis import (
     quick_analyze, scan_pairs, format_scan,
-    fetch_news_calendar, is_news_window, get_session,
+    get_session, is_news_window,
     SYMBOL_MAP, parse_user_input, DEFAULT_SCAN_PAIRS,
+)
+from fundamental import (
+    fetch_forexfactory_calendar, get_upcoming_news,
+    calc_currency_strength, strength_label, strength_emoji,
+    get_pair_interest_diff,
 )
 
 load_dotenv()
@@ -72,7 +77,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /start - menu utama
 /scan - multi-pair scanner (cari high-prob di banyak pair)
 /analyze SYMBOL TF - analisa 1 pair
-/news - high-impact news hari ini
+/news - high-impact news + currency strength
+/strength - currency strength meter
+/rates - central bank interest rates
 /kz - cek session/killzone saat ini
 /pairs - list pair yang didukung
 
@@ -88,10 +95,12 @@ Oil: XTIUSD/OIL
 <b>Timeframe:</b> M1, M5, M15, M30, M45, H1, H2, H4, H8, D1
 
 <b>Filter otomatis:</b>
-✓ News high-impact
+✓ News high-impact (ForexFactory)
 ✓ Killzone (London 01-04 UTC, NY 08-11 UTC)
 ✓ ADX trending check
 ✓ Multi-TF confluence
+✓ Currency strength
+✓ Interest rate differential
 ✓ Minimum score 7/10"""
     await update.message.reply_text(text, parse_mode="HTML")
 
@@ -131,18 +140,58 @@ async def cmd_kz(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    events = fetch_news_calendar()
+    events = fetch_forexfactory_calendar()
     if not events:
-        await update.message.reply_text(
-            "✅ Tidak ada high-impact news hari ini.\n\n"
-            "Tapi tetap cek fundamental lain & session timing.",
-            parse_mode="HTML"
-        )
-        return
-    text = "📅 <b>High-Impact News Hari Ini:</b>\n\n"
-    for ev in events:
-        text += f"• {ev['time_utc']} UTC — {ev['currency']} {ev['event']} ({ev['impact']})\n"
-    text += "\n⚠️ Hindari entry ±30 menit dari news."
+        text = "✅ Tidak ada high-impact news hari ini.\n\n"
+    else:
+        text = "📅 <b>High-Impact News Hari Ini:</b>\n\n"
+        for ev in events[:10]:
+            text += f"• {ev['time_utc']} UTC — {ev['currency']} {ev['event']} ({ev['impact']})\n"
+        text += "\n⚠️ Hindari entry ±30 menit dari news.\n"
+
+    # Add currency strength
+    try:
+        strengths = calc_currency_strength(TWELVEDATA_API_KEY)
+        if strengths:
+            text += "\n💪 <b>Currency Strength (24h):</b>\n"
+            sorted_str = sorted(strengths.items(), key=lambda x: -x[1])
+            for ccy, score in sorted_str:
+                emoji = strength_emoji(score)
+                label = strength_label(score)
+                text += f"  {emoji} {ccy}: {score:+.2f}% ({label})\n"
+    except Exception:
+        pass
+
+    await update.message.reply_text(text, parse_mode="HTML")
+
+
+async def cmd_strength(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Tampilkan currency strength meter."""
+    status = await update.message.reply_text("💪 Menghitung currency strength...")
+    try:
+        strengths = calc_currency_strength(TWELVEDATA_API_KEY)
+        if not strengths:
+            await status.edit_text("❌ Gagal hitung currency strength (rate limit).")
+            return
+        text = "💪 <b>Currency Strength Meter (24h)</b>\n\n"
+        sorted_str = sorted(strengths.items(), key=lambda x: -x[1])
+        for ccy, score in sorted_str:
+            emoji = strength_emoji(score)
+            label = strength_label(score)
+            text += f"  {emoji} {ccy}: {score:+.2f}% ({label})\n"
+        text += "\n<i>Update tiap 1 jam (cached)</i>"
+    except Exception as e:
+        text = f"❌ Error: {e}"
+    await status.edit_text(text, parse_mode="HTML")
+
+
+async def cmd_rates(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Tampilkan interest rate semua central banks."""
+    text = "🏛️ <b>Central Bank Interest Rates</b>\n\n"
+    from fundamental import INTEREST_RATES
+    for ccy, info in INTEREST_RATES.items():
+        text += f"• {ccy}: {info['rate']:.2f}% ({info['central_bank']})\n"
+    text += "\n<i>Last update: per akhir 2024</i>"
     await update.message.reply_text(text, parse_mode="HTML")
 
 
@@ -230,6 +279,8 @@ def main():
     app.add_handler(CommandHandler("pairs", cmd_pairs))
     app.add_handler(CommandHandler("kz", cmd_kz))
     app.add_handler(CommandHandler("news", cmd_news))
+    app.add_handler(CommandHandler("strength", cmd_strength))
+    app.add_handler(CommandHandler("rates", cmd_rates))
     app.add_handler(CommandHandler("scan", cmd_scan))
     app.add_handler(CommandHandler("scam", cmd_scan))  # typo alias
     app.add_handler(CommandHandler("analyze", cmd_analyze))

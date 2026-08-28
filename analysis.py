@@ -16,6 +16,12 @@ import numpy as np
 import requests
 from datetime import datetime, timezone
 
+from fundamental import (
+    fetch_forexfactory_calendar, is_news_window, get_upcoming_news,
+    calc_currency_strength, strength_label, strength_emoji,
+    get_pair_interest_diff, format_fundamental_block,
+)
+
 # === SYMBOL MAP ===
 SYMBOL_MAP = {
     # Forex majors
@@ -584,7 +590,7 @@ def format_analysis(result: dict) -> str:
 
     # Signal emoji
     if sig == "BUY":
-        sig_emoji = "🔴"  # BUY pakai 🟢 (emoji bulat hijau)
+        sig_emoji = "🟢"
     elif sig == "SELL":
         sig_emoji = "🔴"
     else:
@@ -621,32 +627,12 @@ def format_analysis(result: dict) -> str:
 
 """
 
-    # FUNDAMENTAL (simplified dari price action)
-    if sig == "BUY":
-        cot = "Hedge fund net long moderate"
-        retail = "retail long crowded"
-        macro = "netral"
-        strength = "netral"
-        verdict = "BULLISH (skenario)"
-    elif sig == "SELL":
-        cot = "Hedge fund net short moderate"
-        retail = "retail short crowded"
-        macro = "netral"
-        strength = "netral"
-        verdict = "BEARISH (skenario)"
-    else:
-        cot = "Hedge fund net flat"
-        retail = "retail netral"
-        macro = "netral"
-        strength = "netral"
-        verdict = "NETRAL (skenario)"
-
-    text += f"""📰 <b>FUNDAMENTAL</b> (data simplified)
-• COT: {cot}
-• Retail: {retail}
-• Makro: {macro}
-• Strength: {strength}
-• Verdict: {verdict}
+    # FUNDAMENTAL - real-time data
+    try:
+        text += format_fundamental_block(result.get("_api_key", ""), result["symbol"]) + "\n\n"
+    except Exception as e:
+        text += f"""📰 <b>FUNDAMENTAL</b>
+• Data unavailable: {e}
 
 """
 
@@ -660,7 +646,6 @@ def format_analysis(result: dict) -> str:
 
 """
     elif sig == "SELL":
-        # Determine confidence
         if result["entry_type"] == "OB":
             confidence = "tinggi"
         else:
@@ -691,12 +676,12 @@ def format_analysis(result: dict) -> str:
 
 """
 
-    # ALASAN naratif panjang seperti reference
+    # ALASAN naratif panjang
     if sig == "SELL":
         if score >= 7:
-            alasan = f"""🧠 <b>Alasan:</b> Gwl lihat setup {sig} ini skenarionya menarik karena price udah di zona premium (73%) dan struktur bear terakhir masih solid — pullback ke OB {fmtz(result['entry_zone'])} punya probabilitas tinggi buat rejection. ADX {result['adx']:.1f} (trending {'kuat' if result['adx'] > 30 else 'moderat'}), dalam killzone, dan gak ada news high impact — confluence lengkap. Risk-reward 1:3 memungkinkan reward max di TP3 kalau momentum push kuat sampai likuiditas bawah tersapu. Setup {sig} ini layak eksekusi kalau harga retest OB + ada rejection candle di M5."""
+            alasan = f"""🧠 <b>Alasan:</b> Gwl lihat setup SELL ini skenarionya menarik karena price udah di zona premium (73%) dan struktur bear solid — pullback ke OB {fmtz(result['entry_zone'])} punya probabilitas tinggi buat rejection. ADX {result['adx']:.1f} (trending {'kuat' if result['adx'] > 30 else 'moderat'}), dalam killzone, dan gak ada news high impact — confluence lengkap. Risk-reward 1:3 memungkinkan reward max di TP3. Setup SELL ini layak eksekusi kalau harga retest OB + ada rejection candle di M5."""
         else:
-            alasan = f"""🧠 <b>Alasan:</b> Skenario {sig} ada tapi confluence belum lengkap. Struktur H1 menunjukkan bias {result['h1_trend']}, tapi {('H4 vs H1 kontras' if result['h4_trend'] != result['h1_trend'] else 'M15 belum confirm')}. Entry pullback ke OB {fmtz(result['entry_zone'])} menarik tapi sebaiknya tunggu konfirmasi tambahan. Skor {score}/10 belum cukup untuk high-prob entry."""
+            alasan = f"""🧠 <b>Alasan:</b> Skenario SELL ada tapi confluence belum lengkap. Struktur H1 menunjukkan bias {result['h1_trend']}, tapi {('H4 vs H1 kontras' if result['h4_trend'] != result['h1_trend'] else 'M15 belum confirm')}. Entry pullback ke OB {fmtz(result['entry_zone'])} menarik tapi sebaiknya tunggu konfirmasi tambahan. Skor {score}/10 belum cukup untuk high-prob entry."""
     elif sig == "BUY":
         if score >= 7:
             alasan = f"""🧠 <b>Alasan:</b> Gwl lihat setup BUY ini skenarionya menarik karena price udah di zona discount (73%) dan struktur bull solid — pullback ke OB {fmtz(result['entry_zone'])} punya probabilitas tinggi buat bounce. ADX {result['adx']:.1f} (trending {'kuat' if result['adx'] > 30 else 'moderat'}), dalam killzone, dan gak ada news high impact — confluence lengkap. Risk-reward 1:3 memungkinkan reward max di TP3. Setup BUY ini layak eksekusi kalau harga retest OB + rejection candle bullish di M5."""
@@ -724,6 +709,7 @@ def format_analysis(result: dict) -> str:
 def quick_analyze(api_key: str, symbol: str, timeframe: str = "M5") -> str:
     """Shortcut untuk dipanggil bot."""
     result = analyze_full(api_key, symbol, timeframe)
+    result["_api_key"] = api_key  # pass untuk format_fundamental_block
     return format_analysis(result)
 
 
