@@ -397,9 +397,18 @@ def score_setup(
 # === MAIN ANALYSIS ===
 
 def get_zone_width(price: float) -> float:
-    """Adaptive zone width: 0.01% dari price, min 0.005 (untuk forex minor), max 0.5."""
-    w = price * 0.0001
-    return max(0.005, min(0.5, w))
+    """Adaptive zone width 10 pips:
+    - XAUUSD (~4600): 10 pips = 1.0
+    - JPY pairs (~150): 10 pips = 0.10
+    - Major forex (~1.16): 10 pips = 0.0012
+    - Min 0.001, max 1.5
+    """
+    if price > 1000:  # XAUUSD, XAGUSD, oil
+        return 1.0
+    elif price > 50:  # JPY pairs (USDJPY ~150, EURJPY ~160)
+        return 0.10
+    else:  # Major & cross forex (1.0-2.0 range)
+        return max(0.0010, price * 0.001)  # 10 pips = 0.1% dari price
 
 
 def analyze_full(api_key: str, symbol: str, timeframe: str = "M5") -> dict:
