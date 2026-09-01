@@ -1,0 +1,19 @@
+services:
+  - type: worker
+    name: ai-bedah-chart-bot
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false  # Set manual di Render dashboard (secret)
+      - key: TWELVEDATA_API_KEY
+        sync: false  # Set manual di Render dashboard (secret)
+      - key: PORT
+        value: 8080
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: TZ
+        value: UTC
+    healthCheckPath: /health
+    autoDeploy: true

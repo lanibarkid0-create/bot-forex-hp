@@ -1,0 +1,30 @@
+[Unit]
+Description=AI BEDAH CHART Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+User=lani
+Group=lani
+WorkingDirectory=/home/lani/Dokumen/bot-forex
+Environment="PATH=/home/lani/Dokumen/bot-forex/.venv/bin:/usr/bin"
+EnvironmentFile=/home/lani/Dokumen/bot-forex/.env
+ExecStart=/home/lani/Dokumen/bot-forex/.venv/bin/python bot.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/home/lani/Dokumen/bot-forex/bot.log
+StandardError=append:/home/lani/Dokumen/bot-forex/bot.log
+
+# Resource limits
+MemoryMax=512M
+CPUQuota=50%
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/home/lani/Dokumen/bot-forex
+
+[Install]
+WantedBy=multi-user.target

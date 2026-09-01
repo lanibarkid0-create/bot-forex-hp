@@ -11,10 +11,12 @@ Layer konfirmasi:
 
 import re
 import math
+import time
 import pandas as pd
 import numpy as np
 import requests
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from fundamental import (
     fetch_forexfactory_calendar, is_news_window, get_upcoming_news,
@@ -49,6 +51,19 @@ SYMBOL_MAP = {
     "XAGUSD": "XAG/USD", "XAG": "XAG/USD", "SILVER": "XAG/USD",
     # Oil
     "XTIUSD": "CL", "XTI": "CL", "OIL": "CL", "WTI": "CL", "CL": "CL",
+    # Indices
+    "NAS100": "NDX", "US100": "NDX", "NQ": "NDX", "NDX": "NDX",
+    "US30": "DJI", "DJI": "DJI", "DOW": "DJI", "DJIA": "DJI",
+    "SPX500": "SPX", "SP500": "SPX", "SPX": "SPX", "ES": "SPX",
+    "DAX": "DAX", "GER40": "DAX", "DE40": "DAX",
+    "FTSE": "FTSE", "UK100": "FTSE", "UKX": "FTSE",
+    "NIKKEI": "N225", "N225": "N225", "JPN225": "N225", "JP225": "N225",
+    # Commodities
+    "NATGAS": "NG", "NG": "NG", "NATURALGAS": "NG", "GAS": "NG",
+    "BRENT": "BRN", "BRN": "BRN", "UKOIL": "BRN",
+    "COPPER": "HG", "HG": "HG", "XCU": "HG",
+    "WHEAT": "ZW", "ZW": "ZW", "CORN": "ZC", "ZC": "ZC",
+    "BTC": "BTC/USD", "ETH": "ETH/USD",
 }
 
 # === TIMEFRAME MAP ===
@@ -62,8 +77,16 @@ SUPPORTED_TF = ["M1", "M5", "M15", "M30", "M45", "H1", "H2", "H4", "H8", "D1", "
 
 # Default pair list untuk multi-pair scanner
 DEFAULT_SCAN_PAIRS = [
+    # Forex majors
     "EURUSD", "GBPUSD", "AUDUSD", "USDJPY", "USDCHF", "USDCAD",
-    "EURJPY", "GBPJPY", "XAUUSD", "XAGUSD",
+    # Forex crosses (most traded)
+    "EURJPY", "GBPJPY", "AUDJPY", "EURGBP", "GBPAUD",
+    # Metals
+    "XAUUSD", "XAGUSD",
+    # Indices
+    "NAS100", "US30", "SPX500", "DAX", "FTSE", "NIKKEI",
+    # Commodities
+    "OIL", "NATGAS",
 ]
 
 # === SESSION / KILLZONE (UTC) ===
@@ -72,6 +95,14 @@ KILLZONES = {
     "newyork": {"start": 8, "end": 11, "name": "New York Killzone"},
     "london_ny": {"start": 13, "end": 16, "name": "London-NY Overlap"},
 }
+
+# === HTTP SESSION (connection pooling, reuse TCP) ===
+_SESSION = requests.Session()
+_SESSION.headers.update({"User-Agent": "forex-bot/1.0"})
+
+# === CANDLE CACHE (TTL 60 detik) ===
+_CANDLE_CACHE: dict[tuple, tuple[float, "pd.DataFrame"]] = {}
+_CACHE_TTL = 60  # seconds
 
 # === NEWS DATES (high-impact events) ===
 # Format: (date_str, time_utc, event, currency)
@@ -93,26 +124,127 @@ def parse_user_input(text: str) -> tuple[str, str] | None:
     return SYMBOL_MAP[sym], tf
 
 
-def fetch_candles(api_key: str, symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
-    """Fetch candle dari Twelve Data."""
+def fetch_candles(api_key: str, symbol: str, interval: str, limit: int = 200,
+                   max_retries: int = 3) -> pd.DataFrame:
+    """Fetch candle dari Twelve Data dengan cache + retry + rate-limit handling.
+
+    Free tier: 8 API credits/menit. Retry otomatis kalau kena rate limit.
+    """
+    cache_key = (api_key[:8], symbol, interval, limit)
+    now = time.time()
+    cached = _CANDLE_CACHE.get(cache_key)
+    if cached and now - cached[0] < _CACHE_TTL:
+        return cached[1].copy()
+
     url = "https://api.twelvedata.com/time_series"
     params = {
         "symbol": symbol, "interval": interval, "outputsize": limit,
         "order": "ASC", "apikey": api_key,
     }
-    r = requests.get(url, params=params, timeout=20)
-    data = r.json()
-    if data.get("status") == "error":
-        raise RuntimeError(data.get("message", "API error"))
-    values = data.get("values")
-    if not values:
-        raise RuntimeError(f"No data for {symbol} {interval}")
-    df = pd.DataFrame(values)
-    df["datetime"] = pd.to_datetime(df["datetime"], format="%Y-%m-%d %H:%M:%S")
-    for col in ("open", "high", "low", "close"):
-        df[col] = df[col].astype(float)
-    df = df.sort_values("datetime").reset_index(drop=True)
-    return df
+
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            r = _SESSION.get(url, params=params, timeout=20)
+            data = r.json()
+
+            # Cek error
+            if data.get("status") == "error":
+                msg = data.get("message", "API error")
+                last_error = msg
+                # Rate limit → tunggu 60 detik
+                if "credits" in msg.lower() or "rate" in msg.lower() or "limit" in msg.lower():
+                    wait = 60
+                    time.sleep(wait)
+                    continue
+                # Symbol butuh plan upgrade
+                if "plan" in msg.lower() or "grow" in msg.lower() or "venture" in msg.lower():
+                    raise SymbolPlanError(symbol, msg)
+                # Symbol tidak ditemukan
+                if "not found" in msg.lower() or "symbol" in msg.lower():
+                    raise SymbolNotFoundError(symbol, msg)
+                raise RuntimeError(msg)
+
+            values = data.get("values")
+            if not values:
+                raise RuntimeError(f"No data for {symbol} {interval}")
+
+            df = pd.DataFrame(values)
+            df["datetime"] = pd.to_datetime(df["datetime"], format="mixed", errors="coerce")
+            df = df.dropna(subset=["datetime"])
+            for col in ("open", "high", "low", "close"):
+                df[col] = df[col].astype(float)
+            df = df.sort_values("datetime").reset_index(drop=True)
+            _CANDLE_CACHE[cache_key] = (now, df)
+            return df.copy()
+
+        except (SymbolPlanError, SymbolNotFoundError):
+            raise
+        except Exception as e:
+            last_error = str(e)
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)  # exponential backoff
+                continue
+
+    raise RuntimeError(f"Fetch gagal setelah {max_retries} attempt: {last_error}")
+
+
+def fetch_candles_sequential(api_key: str, symbol: str, specs: list[tuple[str, int]],
+                              delay: float = 1.0) -> dict[str, pd.DataFrame]:
+    """Fetch multiple timeframe SEQUENTIAL dengan delay aman untuk free tier.
+
+    Free tier TwelveData = 8 credits/menit → jeda 8 detik aman.
+    Sequential = pasti dapat semua data, tidak ada rate limit hit.
+    """
+    results = {}
+    for i, (interval, limit) in enumerate(specs):
+        if i > 0:
+            time.sleep(delay)
+        try:
+            results[interval] = fetch_candles(api_key, symbol, interval, limit)
+        except Exception as e:
+            results[interval] = None
+    return results
+
+
+def fetch_candles_parallel(api_key: str, symbol: str, specs: list[tuple[str, int]],
+                            max_workers: int = 2, delay: float = 0.5) -> dict[str, pd.DataFrame]:
+    """Fetch multiple timeframe parallel dengan throttle + delay awal.
+
+    specs: list of (interval, limit) tuples
+    max_workers: max concurrent request (default 2, aman untuk free tier 8 req/menit)
+    delay: jeda awal antar request
+    """
+    results = {}
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(specs))) as ex:
+        futures = {
+            ex.submit(fetch_candles, api_key, symbol, interval, limit): interval
+            for interval, limit in specs
+        }
+        for fut in as_completed(futures):
+            interval = futures[fut]
+            try:
+                results[interval] = fut.result()
+            except Exception as e:
+                results[interval] = None
+    return results
+
+
+# === Custom exceptions ===
+class SymbolPlanError(Exception):
+    """Symbol butuh plan upgrade (Grow/Venture/Pro)."""
+    def __init__(self, symbol, msg):
+        self.symbol = symbol
+        self.msg = msg
+        super().__init__(f"{symbol}: {msg}")
+
+
+class SymbolNotFoundError(Exception):
+    """Symbol tidak ditemukan di TwelveData."""
+    def __init__(self, symbol, msg):
+        self.symbol = symbol
+        self.msg = msg
+        super().__init__(f"{symbol}: {msg}")
 
 
 # === ICT/SMC FUNCTIONS ===
@@ -405,153 +537,258 @@ def score_setup(
 
 # === MAIN ANALYSIS ===
 
-def get_zone_width(price: float) -> float:
-    """Adaptive zone width 10 pips:
-    - XAUUSD (~4600): 10 pips = 1.0
-    - JPY pairs (~150): 10 pips = 0.10
-    - Major forex (~1.16): 10 pips = 0.0012
-    - Min 0.001, max 1.5
+def get_zone_width(price: float, mode: str = "intraday") -> float:
+    """Adaptive zone width:
+    - scalping  : 5 pips (tight)
+    - intraday  : 10 pips (default)
+    - swing     : 30 pips (wide)
+    - XAUUSD: 1.0 / JPY: 0.10 / Major forex: 0.001
     """
+    # Base pips per mode
+    pips_map = {"scalping": 5, "intraday": 10, "swing": 30}
+    pips = pips_map.get(mode, 10)
+
     if price > 1000:  # XAUUSD, XAGUSD, oil
-        return 1.0
-    elif price > 50:  # JPY pairs (USDJPY ~150, EURJPY ~160)
-        return 0.10
-    else:  # Major & cross forex (1.0-2.0 range)
-        return max(0.0010, price * 0.001)  # 10 pips = 0.1% dari price
+        return float(pips)  # 1 pip XAU ≈ $0.01, 5 pips = $0.05
+    elif price > 50:  # JPY pairs
+        return pips * 0.01  # 1 pip JPY = 0.01
+    else:  # Major & cross forex
+        return max(0.0005, price * 0.0001 * pips)  # 1 pip ≈ 0.0001 dari price
 
 
-def analyze_full(api_key: str, symbol: str, timeframe: str = "M5") -> dict:
-    """High-probability analysis dengan multi-timeframe confluence.
+def analyze_full(api_key: str, symbol: str, timeframe: str = "M5", mode: str = "intraday") -> dict:
+    """High-probability analysis dengan 6-timeframe confluence (D1/H4/H1/M30/M15/M5).
 
-    Returns dict dengan:
-    - signal: BUY/SELL/WAIT
-    - score: 0-10
-    - high_prob: bool
-    - entry_zone, sl_zone, tp_zones
-    - bias_htf, structure_ltf
-    - reasons
-    - skip_reasons (kalau WAIT)
+    Args:
+        api_key: TwelveData API key
+        symbol: trading pair (e.g. EURUSD, XAUUSD, NAS100)
+        timeframe: entry timeframe (M5 recommended)
+        mode: 'scalping' (M5-only entry, tighter SL, 5-15 pips TP)
+              'intraday' (multi-TF, standard SL/TP, 10-30 pips)
+              'swing' (HTF-only, wider SL/TP, 50-150 pips)
+
+    Returns dict dengan signal/score/entry_zone/sl_zone/tp_zones/multi-TF trends dll.
     """
     td_sym = SYMBOL_MAP.get(symbol.upper(), symbol)
     td_tf = TF_MAP.get(timeframe, "5min")
 
-    # Fetch data
-    df = fetch_candles(api_key, td_sym, td_tf, limit=200)
-    df_h1 = fetch_candles(api_key, td_sym, "1h", limit=200)
-    df_h4 = fetch_candles(api_key, td_sym, "4h", limit=100)
-    df_m15 = fetch_candles(api_key, td_sym, "15min", limit=200)
+    # === MULTI-TIMEFRAME FETCH (sequential, aman rate-limit) ===
+    # HTF (D1, H4) → trend utama
+    # MTF (H1, M30) → pullback zone
+    # LTF (M15) → struktur
+    # Entry TF (M5) → konfirmasi rejection
+    # Sequential = 1 credit / 8 detik, total 6 TF = ~50 detik (dengan cache 60s → cepat)
+    specs = [
+        (td_tf, 200),     # Entry TF
+        ("5min", 200),    # M5 confirmation
+        ("15min", 200),   # M15 structure
+        ("30min", 200),   # M30 pullback
+        ("1h", 200),      # H1 bias
+        ("4h", 100),      # H4 trend
+        ("1day", 100),    # D1 trend utama
+    ]
+    try:
+        fetched = fetch_candles_sequential(api_key, td_sym, specs, delay=0.3)
+    except SymbolPlanError as e:
+        # Symbol butuh plan upgrade → kasih pesan jelas
+        raise SymbolPlanError(symbol, f"'{symbol}' butuh plan Grow/Venture di TwelveData. Coba pair forex (EURUSD, XAUUSD) yang free.")
+    except SymbolNotFoundError as e:
+        raise SymbolNotFoundError(symbol, f"'{symbol}' tidak ditemukan di TwelveData.")
+
+    df = fetched.get(td_tf)
+    df_m5 = fetched.get("5min")
+    df_m15 = fetched.get("15min")
+    df_m30 = fetched.get("30min")
+    df_h1 = fetched.get("1h")
+    df_h4 = fetched.get("4h")
+    df_d1 = fetched.get("1day")
+    if df is None or df_m5 is None or df_m15 is None or df_h1 is None or df_h4 is None or df_d1 is None:
+        failed = [tf for tf, df_v in zip([td_tf, "5min", "15min", "30min", "1h", "4h", "1day"], [df, df_m5, df_m15, df_m30, df_h1, df_h4, df_d1]) if df_v is None]
+        raise RuntimeError(f"Gagal fetch {symbol} di TF: {', '.join(failed)}")
 
     price = float(df["close"].iloc[-1])
 
-    # Multi-TF structure
+    # Multi-TF structure (6 timeframe)
+    ms_d1 = get_market_structure(df_d1)
     ms_h4 = get_market_structure(df_h4)
     ms_h1 = get_market_structure(df_h1)
+    ms_m30 = get_market_structure(df_m30)
     ms_m15 = get_market_structure(df_m15)
-    ms_m5 = get_market_structure(df)
+    ms_m5 = get_market_structure(df_m5)
 
-    # Decide bias & signal
+    # === DECIDE BIAS (HTF + MTF voting, BUKAN M5) ===
+    # Multi-TF = untuk ANALISA BIAS saja (D1, H4, H1, M30, M15)
+    # M5 = STRICT untuk entry confirmation (CHoCH, OB, FVG, SL, TP)
+    d1_trend = ms_d1["trend"]
     h4_trend = ms_h4["trend"]
     h1_trend = ms_h1["trend"]
-    bias = h1_trend if h1_trend != "neutral" else h4_trend
+    m30_trend = ms_m30["trend"]
+    m15_trend = ms_m15["trend"]
+    m5_trend = ms_m5["trend"]  # info only, TIDAK masuk voting
 
-    if bias == "bullish":
+    # Voting: D1=3, H4=3, H1=2, M30=1, M15=1 (HTF dominan, M5 excluded)
+    votes = {"bullish": 0, "bearish": 0, "neutral": 0}
+    for trend, weight in [(d1_trend, 3), (h4_trend, 3), (h1_trend, 2), (m30_trend, 1), (m15_trend, 1)]:
+        votes[trend] = votes.get(trend, 0) + weight
+
+    if votes["bullish"] > votes["bearish"] and votes["bullish"] >= 3:
+        bias = "bullish"
+    elif votes["bearish"] > votes["bullish"] and votes["bearish"] >= 3:
+        bias = "bearish"
+    else:
+        bias = "neutral"
+
+    # M5 STRICT KONFIRMASI: butuh CHoCH searah bias di M5 untuk entry
+    # - bullish bias + M5 CHoCH bullish → BUY signal
+    # - bearish bias + M5 CHoCH bearish → SELL signal
+    # - else WAIT (tunggu CHoCH confirm)
+    m5_choch = ms_m5.get("choch")
+    if bias == "bullish" and m5_choch == "bullish":
         signal = "BUY"
-    elif bias == "bearish":
+    elif bias == "bearish" and m5_choch == "bearish":
         signal = "SELL"
+    elif bias != "neutral" and ms_m5.get("bos") == bias:
+        # BOS searah tanpa CHoCH = weaker entry
+        signal = "BUY" if bias == "bullish" else "SELL"
     else:
         signal = "WAIT"
 
-    # Detect entry zone di TF target
-    fvgs = [f for f in detect_fvg(df) if not is_mitigated_fvg(f, df) and f["candle_idx"] >= len(df) - 30]
-    obses = [o for o in detect_order_blocks(df) if not is_mitigated_ob(o, df) and o["candle_idx"] >= len(df) - 30]
-    liq = detect_liquidity(df)
+    # === ENTRY ZONE (STRICT M5) ===
+    # Deteksi OB/FVG di M5 saja (low TF untuk entry)
+    # Validasi: zone harus searah bias, di bawah/atas price (discount/premium), belum dimitigasi
+    fvgs_m5 = [f for f in detect_fvg(df) if not is_mitigated_fvg(f, df) and f["candle_idx"] >= len(df) - 30]
+    obses_m5 = [o for o in detect_order_blocks(df) if not is_mitigated_ob(o, df) and o["candle_idx"] >= len(df) - 30]
+    liq_m5 = detect_liquidity(df)
 
     entry_zone = None
+    entry_zone_full = None  # full OB/FVG range (sebelum shrink)
     sl_zone = None
     tp_zones = []
     entry_type = "none"
-    zw = get_zone_width(price)
+    zw = get_zone_width(price, mode)
 
     def shrink(low, high):
+        """Shrink zone jadi lebih presisi (mid ± zw/2)."""
         mid = (low + high) / 2
         return {"low": mid - zw / 2, "high": mid + zw / 2}
 
     if signal == "BUY":
-        bull_obs = [o for o in obses if o["type"] == "bullish" and o["high"] < price]
-        bull_fvgs = [f for f in fvgs if f["type"] == "bullish" and f["high"] < price]
+        # Cari bullish OB/FVG di BAWAH price (discount zone)
+        bull_obs = [o for o in obses_m5 if o["type"] == "bullish" and o["high"] < price]
+        bull_fvgs = [f for f in fvgs_m5 if f["type"] == "bullish" and f["high"] < price]
         if bull_obs:
-            ob = bull_obs[-1]
+            ob = bull_obs[-1]  # OB terakhir
+            entry_zone_full = {"low": ob["low"], "high": ob["high"]}
             entry_zone = shrink(ob["low"], ob["high"])
             entry_type = "OB"
         elif bull_fvgs:
             fvg = bull_fvgs[-1]
+            entry_zone_full = {"low": fvg["low"], "high": fvg["high"]}
             entry_zone = shrink(fvg["low"], fvg["high"])
             entry_type = "FVG"
         elif ms_m5["swing_lows"]:
             sl_price = float(df["low"].iloc[ms_m5["swing_lows"][-1]])
-            entry_zone = shrink(sl_price - 0.25, sl_price + 0.25)
+            entry_zone_full = {"low": sl_price, "high": sl_price}
+            entry_zone = shrink(sl_price - abs(price) * 0.0005, sl_price + abs(price) * 0.0005)
             entry_type = "swing_low"
     elif signal == "SELL":
-        bear_obs = [o for o in obses if o["type"] == "bearish" and o["low"] > price]
-        bear_fvgs = [f for f in fvgs if f["type"] == "bearish" and f["low"] > price]
+        # Cari bearish OB/FVG di ATAS price (premium zone)
+        bear_obs = [o for o in obses_m5 if o["type"] == "bearish" and o["low"] > price]
+        bear_fvgs = [f for f in fvgs_m5 if f["type"] == "bearish" and f["low"] > price]
         if bear_obs:
             ob = bear_obs[-1]
+            entry_zone_full = {"low": ob["low"], "high": ob["high"]}
             entry_zone = shrink(ob["low"], ob["high"])
             entry_type = "OB"
         elif bear_fvgs:
             fvg = bear_fvgs[-1]
+            entry_zone_full = {"low": fvg["low"], "high": fvg["high"]}
             entry_zone = shrink(fvg["low"], fvg["high"])
             entry_type = "FVG"
         elif ms_m5["swing_highs"]:
             sh_price = float(df["high"].iloc[ms_m5["swing_highs"][-1]])
-            entry_zone = shrink(sh_price - 0.25, sh_price + 0.25)
+            entry_zone_full = {"low": sh_price, "high": sh_price}
+            entry_zone = shrink(sh_price - abs(price) * 0.0005, sh_price + abs(price) * 0.0005)
             entry_type = "swing_high"
 
-    # SL & TP - pakai swing yang dekat dengan price (max 2% dari price)
+    # === SL & TP (STRICT M5 swing high/low) ===
+    # SL = swing low/high M5 di bawah/atas entry (low TF)
+    # TP = swing high/low M5 di atas/bawah entry (low TF) + RR ratio fallback
     if entry_zone and signal != "WAIT":
         entry_mid = (entry_zone["low"] + entry_zone["high"]) / 2
-        max_sl_dist = abs(price) * 0.02  # max 2% dari price
+        sl_pct = {"scalping": 0.005, "intraday": 0.01, "swing": 0.03}.get(mode, 0.01)
+        max_sl_dist = abs(price) * sl_pct
+        rr_set = {"scalping": [1.0, 1.5, 2.0], "intraday": [1.0, 1.5, 3.0], "swing": [2.0, 3.0, 5.0]}.get(mode, [1.0, 1.5, 3.0])
+        tp_labels = ["TP1", "TP2", "TP3"]
 
         if signal == "BUY":
-            # Cari swing low terdekat dengan price (di bawah entry)
+            # === SL: cari swing low M5 di BAWAH entry ===
             sl_candidates = []
             for idx in ms_m5["swing_lows"]:
                 sw_low = float(df["low"].iloc[idx])
                 if sw_low < entry_zone["low"] and (entry_zone["low"] - sw_low) <= max_sl_dist:
                     sl_candidates.append(sw_low)
-            if liq["ssl_price"] and liq["ssl_price"] < entry_zone["low"] and (entry_zone["low"] - liq["ssl_price"]) <= max_sl_dist:
-                sl_candidates.append(liq["ssl_price"])
-            sl_ref = min(sl_candidates) if sl_candidates else (entry_zone["low"] - abs(price) * 0.005)
+            if liq_m5["ssl_price"] and liq_m5["ssl_price"] < entry_zone["low"] and (entry_zone["low"] - liq_m5["ssl_price"]) <= max_sl_dist:
+                sl_candidates.append(liq_m5["ssl_price"])
+            sl_ref = min(sl_candidates) if sl_candidates else (entry_zone["low"] - abs(price) * sl_pct / 2)
 
-            sl_mid = sl_ref - abs(price) * 0.0005  # 5 pips buffer untuk XAU, scaled
+            sl_mid = sl_ref - abs(price) * 0.0002
             sl_zone = {"low": sl_mid - zw / 2, "high": sl_mid + zw / 2}
             risk = entry_mid - sl_zone["high"]
             if risk > 0:
-                tp_zones = [
-                    {**shrink(entry_mid + risk * 1 - zw / 2, entry_mid + risk * 1 + zw / 2), "rr": 1.0, "label": "TP1"},
-                    {**shrink(entry_mid + risk * 1.5 - zw / 2, entry_mid + risk * 1.5 + zw / 2), "rr": 1.5, "label": "TP2"},
-                    {**shrink(entry_mid + risk * 3 - zw / 2, entry_mid + risk * 3 + zw / 2), "rr": 3.0, "label": "TP3"},
-                ]
+                # === TP: cari swing high M5 di ATAS entry sebagai target ===
+                tp_candidates = []
+                for idx in ms_m5["swing_highs"]:
+                    sh = float(df["high"].iloc[idx])
+                    if sh > entry_zone["high"]:
+                        # Hitung RR natural ke swing high ini
+                        natural_rr = (sh - entry_mid) / risk
+                        if natural_rr >= rr_set[0]:  # minimal RR TP1
+                            tp_candidates.append((sh, natural_rr))
+                tp_candidates.sort(key=lambda x: x[1])  # sort by RR
+
+                # Bangun TP zones: prefer swing high M5, fallback ke RR ratio
+                tp_zones = []
+                for i, (rr_target, label) in enumerate(zip(rr_set, tp_labels)):
+                    if i < len(tp_candidates):
+                        sh, _ = tp_candidates[i]
+                        tp_zones.append({**shrink(sh - zw / 2, sh + zw / 2), "rr": round((sh - entry_mid) / risk, 2), "label": label, "source": "M5 swing"})
+                    else:
+                        # Fallback ke RR-based
+                        tp_zones.append({**shrink(entry_mid + risk * rr_target - zw / 2, entry_mid + risk * rr_target + zw / 2), "rr": rr_target, "label": label, "source": "RR ratio"})
+
         else:  # SELL
-            # Cari swing high terdekat dengan price (di atas entry)
+            # === SL: cari swing high M5 di ATAS entry ===
             sl_candidates = []
             for idx in ms_m5["swing_highs"]:
                 sw_high = float(df["high"].iloc[idx])
                 if sw_high > entry_zone["high"] and (sw_high - entry_zone["high"]) <= max_sl_dist:
                     sl_candidates.append(sw_high)
-            if liq["bsl_price"] and liq["bsl_price"] > entry_zone["high"] and (liq["bsl_price"] - entry_zone["high"]) <= max_sl_dist:
-                sl_candidates.append(liq["bsl_price"])
-            sl_ref = max(sl_candidates) if sl_candidates else (entry_zone["high"] + abs(price) * 0.005)
+            if liq_m5["bsl_price"] and liq_m5["bsl_price"] > entry_zone["high"] and (liq_m5["bsl_price"] - entry_zone["high"]) <= max_sl_dist:
+                sl_candidates.append(liq_m5["bsl_price"])
+            sl_ref = max(sl_candidates) if sl_candidates else (entry_zone["high"] + abs(price) * sl_pct / 2)
 
-            sl_mid = sl_ref + abs(price) * 0.0005
+            sl_mid = sl_ref + abs(price) * 0.0002
             sl_zone = {"low": sl_mid - zw / 2, "high": sl_mid + zw / 2}
             risk = sl_zone["low"] - entry_mid
             if risk > 0:
-                tp_zones = [
-                    {**shrink(entry_mid - risk * 1 - zw / 2, entry_mid - risk * 1 + zw / 2), "rr": 1.0, "label": "TP1"},
-                    {**shrink(entry_mid - risk * 1.5 - zw / 2, entry_mid - risk * 1.5 + zw / 2), "rr": 1.5, "label": "TP2"},
-                    {**shrink(entry_mid - risk * 3 - zw / 2, entry_mid - risk * 3 + zw / 2), "rr": 3.0, "label": "TP3"},
-                ]
+                # === TP: cari swing low M5 di BAWAH entry sebagai target ===
+                tp_candidates = []
+                for idx in ms_m5["swing_lows"]:
+                    sl_p = float(df["low"].iloc[idx])
+                    if sl_p < entry_zone["low"]:
+                        natural_rr = (entry_mid - sl_p) / risk
+                        if natural_rr >= rr_set[0]:
+                            tp_candidates.append((sl_p, natural_rr))
+                tp_candidates.sort(key=lambda x: x[1])
+
+                tp_zones = []
+                for i, (rr_target, label) in enumerate(zip(rr_set, tp_labels)):
+                    if i < len(tp_candidates):
+                        sl_p, _ = tp_candidates[i]
+                        tp_zones.append({**shrink(sl_p - zw / 2, sl_p + zw / 2), "rr": round((entry_mid - sl_p) / risk, 2), "label": label, "source": "M5 swing"})
+                    else:
+                        tp_zones.append({**shrink(entry_mid - risk * rr_target - zw / 2, entry_mid - risk * rr_target + zw / 2), "rr": rr_target, "label": label, "source": "RR ratio"})
 
     # Range & session checks
     adx = compute_adx(df_m15)
@@ -638,13 +875,16 @@ def analyze_full(api_key: str, symbol: str, timeframe: str = "M5") -> dict:
         skip_reasons.append("Tidak ada OB/FVG valid di TF target")
 
     return {
-        "symbol": td_sym, "timeframe": timeframe, "price": price,
+        "symbol": td_sym, "timeframe": timeframe, "price": price, "mode": mode,
         "signal": signal, "bias": bias,
-        "h4_trend": h4_trend, "h1_trend": h1_trend, "m15_trend": ms_m15["trend"], "m5_trend": ms_m5["trend"],
-        "h1_choch": ms_h1["choch"], "m15_choch": ms_m15["choch"],
+        "d1_trend": d1_trend, "h4_trend": h4_trend, "h1_trend": h1_trend,
+        "m30_trend": m30_trend, "m15_trend": m15_trend, "m5_trend": m5_trend,
+        "votes": votes,
+        "h1_choch": ms_h1["choch"], "m15_choch": ms_m15["choch"], "m5_choch": ms_m5["choch"],
         "adx": adx, "session": session, "in_news": in_news, "news_event": news_event,
-        "entry_zone": entry_zone, "sl_zone": sl_zone, "tp_zones": tp_zones,
-        "entry_type": entry_type,
+        "entry_zone": entry_zone, "entry_zone_full": entry_zone_full,
+        "sl_zone": sl_zone, "tp_zones": tp_zones,
+        "entry_type": entry_type, "m5_choch": m5_choch, "m5_bos": ms_m5.get("bos"),
         "score": score_info["score"], "score_breakdown": score_info["breakdown"],
         "high_prob": score_info["high_prob"],
         "skip_reasons": skip_reasons,
@@ -685,8 +925,10 @@ def format_analysis(result: dict) -> str:
     fmtz = lambda z: f"{z['low']:.2f}–{z['high']:.2f}" if z else "-"
 
     # Header
+    mode_emoji = {"scalping": "⚡", "intraday": "🎯", "swing": "🌊"}.get(result.get("mode", "intraday"), "🎯")
+    mode_label = {"scalping": "SCALPING", "intraday": "INTRADAY", "swing": "SWING"}.get(result.get("mode", "intraday"), "INTRADAY")
     text = f"""📊 <b>AI BEDAH CHART — {result['symbol']} · {result['timeframe']}</b>
-   <i>analisa AI · alat bantu, BUKAN sinyal resmi</i>
+   {mode_emoji} Mode: <b>{mode_label}</b> · <i>analisa AI · alat bantu, BUKAN sinyal resmi</i>
 
 """
 
@@ -704,11 +946,28 @@ def format_analysis(result: dict) -> str:
     else:
         zona = "netral 50%"
 
-    text += f"""🏛️ <b>STRUKTUR (SMC)</b>
-• Tren: swing {result['h4_trend'].upper()} · internal {result['h1_trend'].upper()}
+    # === 6-TIMEFRAME TREND MATRIX ===
+    def tf_emoji(t):
+        return {"bullish": "🟢", "bearish": "🔴", "neutral": "⚪"}.get(t, "⚪")
+
+    d1_e = tf_emoji(result.get("d1_trend", "neutral"))
+    h4_e = tf_emoji(result.get("h4_trend", "neutral"))
+    h1_e = tf_emoji(result.get("h1_trend", "neutral"))
+    m30_e = tf_emoji(result.get("m30_trend", "neutral"))
+    m15_e = tf_emoji(result.get("m15_trend", "neutral"))
+    m5_e = tf_emoji(result.get("m5_trend", "neutral"))
+
+    votes = result.get("votes", {})
+    vote_text = ""
+    if votes:
+        vote_text = f"\n• Voting: 🟢{votes.get('bullish', 0)} vs 🔴{votes.get('bearish', 0)} (HTF-weighted)"
+
+    text += f"""🏛️ <b>STRUKTUR (SMC) — 6 TIMEFRAME</b>
+• HTF : D1 {d1_e} · H4 {h4_e} · H1 {h1_e}
+• MTF : M30 {m30_e} · M15 {m15_e}
+• LTF : M5  {m5_e}{vote_text}
 • Struktur terakhir: {structure_last}
 • Harga <b>{p:.2f}</b> · zona {zona}
-• Range: {p*0.997:.2f} – {p*1.003:.2f}
 • Likuiditas: {'resting di BSL' if result['signal'] != 'BUY' else 'resting di SSL'}
 
 """
@@ -759,45 +1018,64 @@ def format_analysis(result: dict) -> str:
 
 """
 
-    # IDEAL SETUP
+    # === IDEAL SETUP — AREA ZONA ENTRY/SL/TP (STRICT M5) ===
     if sig == "WAIT" or result["entry_zone"] is None:
         text += f"""🎯 <b>IDEAL SETUP</b>
 🟡 {sig} — belum ada setup jelas
-• Tunggu struktur terkonfirmasi (CHoCH valid)
+• Tunggu CHoCH valid di M5 (low TF)
 • Avoid entry di area netral
 • KonviksI: tunggu pullback ke OB atau break structure dulu
 
 """
-    elif sig == "SELL":
-        if result["entry_type"] == "OB":
-            confidence = "tinggi"
+    else:
+        # === M5 KONFIRMASI STATUS ===
+        m5c = result.get("m5_choch")
+        m5b = result.get("m5_bos")
+        confirm_text = ""
+        if m5c:
+            confirm_text = f"✅ M5 CHoCH {m5c.upper()} (entry trigger valid)"
+        elif m5b:
+            confirm_text = f"⚠️ M5 BOS {m5b.upper()} (tanpa CHoCH — weaker)"
         else:
-            confidence = "medium"
-        text += f"""🎯 <b>IDEAL SETUP</b>
-🔴 SELL — tunggu pullback
-• Entry (Order Block): {fmtz(result['entry_zone'])} ⏳ tunggu retest
-• SL: {fmtz(result['sl_zone'])}
-"""
-        for tp in result["tp_zones"]:
-            text += f"• {tp['label']}: {tp['low']:.2f} (+{tp['rr']}R)\n"
-        text += f"""• KonviksI: {'SEDANG —' if score >= 6 else 'KURANG —'} {'searah tren + zona bagus' if score >= 6 else 'butuh konfirmasi tambahan'}
+            confirm_text = "❌ Belum ada M5 CHoCH/BOS (tunggu trigger)"
 
-"""
-    else:  # BUY
-        if result["entry_type"] == "OB":
-            confidence = "tinggi"
-        else:
-            confidence = "medium"
-        text += f"""🎯 <b>IDEAL SETUP</b>
-🟢 BUY — tunggu pullback
-• Entry (Order Block): {fmtz(result['entry_zone'])} ⏳ tunggu retest
-• SL: {fmtz(result['sl_zone'])}
-"""
-        for tp in result["tp_zones"]:
-            text += f"• {tp['label']}: {tp['low']:.2f} (+{tp['rr']}R)\n"
-        text += f"""• KonviksI: {'SEDANG —' if score >= 6 else 'KURANG —'} {'searah tren + zona bagus' if score >= 6 else 'butuh konfirmasi tambahan'}
+        # === AREA ZONA VISUAL ===
+        entry_low = result["entry_zone"]["low"]
+        entry_high = result["entry_zone"]["high"]
+        sl_low = result["sl_zone"]["low"] if result["sl_zone"] else 0
+        sl_high = result["sl_zone"]["high"] if result["sl_zone"] else 0
+        emoji = "🟢" if sig == "BUY" else "🔴"
+        e_type = result.get("entry_type", "none")
+        e_label = {"OB": "Order Block", "FVG": "Fair Value Gap", "swing_low": "Swing Low", "swing_high": "Swing High"}.get(e_type, e_type)
 
+        # Visual: area bar
+        text += f"""🎯 <b>AREA ZONA (M5 — strict)</b>
+{confirm_text}
+• Tipe Entry : <b>{e_label}</b>
+• Harga      : <b>{p:.2f}</b>
+• Entry Zone : <b>{entry_low:.2f} — {entry_high:.2f}</b>  📍 ({e_type})
+• Stop Loss  : <b>{sl_low:.2f} — {sl_high:.2f}</b>  🛑
 """
+        # TP dengan source indicator
+        for tp in result["tp_zones"]:
+            source_icon = "🎯" if tp.get("source") == "M5 swing" else "📐"
+            text += f"• {tp['label']:4}      : <b>{tp['low']:.2f} — {tp['high']:.2f}</b>  {source_icon} (RR +{tp['rr']}R)\n"
+
+        # === RISK METER ===
+        if result["sl_zone"] and result["entry_zone"]:
+            entry_mid = (entry_low + entry_high) / 2
+            sl_mid = (sl_low + sl_high) / 2
+            risk_pips = abs(entry_mid - sl_mid)
+            if p > 1000:
+                risk_str = f"${risk_pips:.2f}"
+            elif p > 50:
+                risk_str = f"{risk_pips:.3f}"
+            else:
+                risk_str = f"{risk_pips * 10000:.1f} pips"
+            text += f"• Risk         : <b>{risk_str}</b> per 1 lot\n"
+
+        # KonviksI
+        text += f"• KonviksI     : <b>{'TINGGI' if score >= 7 else 'SEDANG' if score >= 5 else 'KURANG'}</b> (skor {score}/10)\n\n"
 
     # ALASAN naratif panjang
     if sig == "SELL":
@@ -829,27 +1107,30 @@ def format_analysis(result: dict) -> str:
     return text
 
 
-def quick_analyze(api_key: str, symbol: str, timeframe: str = "M5") -> str:
-    """Shortcut untuk dipanggil bot."""
-    result = analyze_full(api_key, symbol, timeframe)
+def quick_analyze(api_key: str, symbol: str, timeframe: str = "M5", mode: str = "intraday") -> str:
+    """Shortcut untuk dipanggil bot. Mode: scalping/intraday/swing."""
+    result = analyze_full(api_key, symbol, timeframe, mode)
     result["_api_key"] = api_key  # pass untuk format_fundamental_block
     return format_analysis(result)
 
 
-# === MULTI-PAIR SCANNER ===
-
 def scan_pairs(api_key: str, pairs: list[str] = None) -> list[dict]:
-    """Scan banyak pair, return list of setups high-probability."""
+    """Scan banyak pair SECARA PARALLEL, return list of setups high-probability."""
     if pairs is None:
         pairs = DEFAULT_SCAN_PAIRS
     results = []
-    for pair in pairs:
-        try:
-            r = analyze_full(api_key, pair, "M5")
-            if r["high_prob"]:
-                results.append(r)
-        except Exception:
-            continue
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        futures = {ex.submit(analyze_full, api_key, pair, "M5"): pair for pair in pairs}
+        for fut in as_completed(futures):
+            pair = futures[fut]
+            try:
+                r = fut.result()
+                if r["high_prob"]:
+                    results.append(r)
+            except Exception:
+                continue
+    # Sort by score desc
+    results.sort(key=lambda x: x.get("score", 0), reverse=True)
     return results
 
 
