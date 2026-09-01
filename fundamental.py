@@ -92,12 +92,32 @@ def is_news_window(buffer_min: int = 30) -> tuple[bool, str]:
 # vs major counterpart - CACHED setiap 1 jam
 
 STRENGTH_CACHE = {"timestamp": None, "data": {}}
-STRENGTH_CACHE_TTL = 3600  # 1 jam
+STRENGTH_CACHE_TTL = 600  # 10 menit (was 1 jam) — lebih fresh
+
+
+def _fetch_one_strength(api_key: str, pair: str) -> float:
+    """Fetch single pair untuk strength calculation."""
+    try:
+        from analysis import _SESSION
+        url = "https://api.twelvedata.com/time_series"
+        params = {
+            "symbol": pair, "interval": "15min", "outputsize": 96,
+            "order": "ASC", "apikey": api_key,
+        }
+        r = _SESSION.get(url, params=params, timeout=10)
+        data = r.json()
+        if data.get("values") and len(data["values"]) >= 2:
+            first = float(data["values"][0]["close"])
+            last = float(data["values"][-1]["close"])
+            return ((last - first) / first) * 100
+        return 0
+    except Exception:
+        return 0
 
 
 def calc_currency_strength(api_key: str, periods: int = 96) -> dict:
-    """Hitung currency strength untuk 8 major currencies (USD, EUR, GBP, JPY, AUD, NZD, CAD, CHF).
-    Cached setiap 1 jam untuk hemat API credits.
+    """Hitung currency strength untuk 8 major currencies (PARALLEL fetch).
+    Cached 10 menit untuk hemat API credits + speed.
     """
     now = datetime.now(timezone.utc)
     if STRENGTH_CACHE["timestamp"]:
@@ -117,27 +137,20 @@ def calc_currency_strength(api_key: str, periods: int = 96) -> dict:
     }
     is_inverse = {"USD": True, "CAD": True, "CHF": True}
 
+    # PARALLEL fetch (4 workers → 8 pair selesai dalam ~2 detik bukan ~8 detik)
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     strengths = {}
-    for ccy, pair in pairs.items():
-        try:
-            url = "https://api.twelvedata.com/time_series"
-            params = {
-                "symbol": pair, "interval": "15min", "outputsize": periods,
-                "order": "ASC", "apikey": api_key,
-            }
-            r = requests.get(url, params=params, timeout=10)
-            data = r.json()
-            if data.get("values") and len(data["values"]) >= 2:
-                first = float(data["values"][0]["close"])
-                last = float(data["values"][-1]["close"])
-                pct = ((last - first) / first) * 100
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futures = {ex.submit(_fetch_one_strength, api_key, pair): ccy for ccy, pair in pairs.items()}
+        for fut in as_completed(futures):
+            ccy = futures[fut]
+            try:
+                pct = fut.result()
                 if is_inverse.get(ccy):
                     pct = -pct
                 strengths[ccy] = round(pct, 2)
-            else:
+            except Exception:
                 strengths[ccy] = 0
-        except Exception:
-            strengths[ccy] = 0
 
     STRENGTH_CACHE["timestamp"] = now
     STRENGTH_CACHE["data"] = strengths
