@@ -3,8 +3,10 @@
 All data gratis (free tier / public API).
 """
 
+import os
 import re
 import json
+import time
 import requests
 from datetime import datetime, timezone, timedelta
 
@@ -325,3 +327,135 @@ def format_fundamental_block(api_key: str, symbol: str) -> str:
     lines.append("  • Note: real COT data dari CFTC.gov, update tiap Jumat")
 
     return "\n".join(lines)
+
+
+# === FINNHUB INTEGRATION (DXY, US10Y, VIX, news) ===
+# Free tier: 60 API calls/minute
+# Daftar di https://finnhub.io/ untuk API key
+
+FINNHUB_BASE = "https://finnhub.io/api/v1"
+FINNHUB_CACHE = {"data": {}, "ts": {}}
+_FINNHUB_TTL = 300  # 5 menit cache
+
+
+def _finnhub_get(endpoint: str, api_key: str, **params) -> dict:
+    """Generic Finnhub GET dengan cache 5 menit."""
+    cache_key = f"{endpoint}:{json.dumps(params, sort_keys=True)}"
+    now = time.time()
+    if cache_key in FINNHUB_CACHE["data"]:
+        if now - FINNHUB_CACHE["ts"].get(cache_key, 0) < _FINNHUB_TTL:
+            return FINNHUB_CACHE["data"][cache_key]
+
+    if not api_key:
+        return {}
+
+    try:
+        url = f"{FINNHUB_BASE}/{endpoint}"
+        params["token"] = api_key
+        r = requests.get(url, params=params, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            FINNHUB_CACHE["data"][cache_key] = data
+            FINNHUB_CACHE["ts"][cache_key] = now
+            return data
+    except Exception:
+        pass
+    return {}
+
+
+def get_dxy(api_key: str = "") -> dict:
+    """Get Dollar Index (DXY) latest data dari Finnhub.
+    Returns: {current, change_pct, trend} atau {} kalau gagal.
+    """
+    if not api_key:
+        return {}
+    data = _finnhub_get("quote", api_key, symbol="DXY")
+    if not data or "c" not in data:
+        return {}
+    current = data.get("c", 0)
+    prev_close = data.get("pc", 0)
+    change_pct = ((current - prev_close) / prev_close * 100) if prev_close else 0
+    return {
+        "current": round(current, 3),
+        "change_pct": round(change_pct, 3),
+        "high": data.get("h", 0),
+        "low": data.get("l", 0),
+    }
+
+
+def get_us10y_yield(api_key: str = "") -> dict:
+    """Get US 10Y Treasury yield dari Finnhub.
+    Returns: {current, change_pct} atau {}.
+    """
+    if not api_key:
+        return {}
+    # US10Y di Finnhub
+    data = _finnhub_get("quote", api_key, symbol="US10Y")
+    if not data or "c" not in data:
+        return {}
+    current = data.get("c", 0)
+    prev_close = data.get("pc", 0)
+    change_pct = ((current - prev_close) / prev_close * 100) if prev_close else 0
+    return {
+        "current": round(current, 3),
+        "change_pct": round(change_pct, 3),
+    }
+
+
+def get_vix(api_key: str = "") -> dict:
+    """Get VIX (CBOE Volatility Index) dari Finnhub.
+    Returns: {current, change_pct, level} atau {}.
+    """
+    if not api_key:
+        return {}
+    data = _finnhub_get("quote", api_key, symbol="VIX")
+    if not data or "c" not in data:
+        return {}
+    current = data.get("c", 0)
+    prev_close = data.get("pc", 0)
+    change_pct = ((current - prev_close) / prev_close * 100) if prev_close else 0
+    level = "low" if current < 15 else "normal" if current < 25 else "elevated" if current < 35 else "extreme"
+    return {
+        "current": round(current, 2),
+        "change_pct": round(change_pct, 2),
+        "level": level,
+    }
+
+
+def get_finnhub_news(api_key: str = "", category: str = "forex") -> list[dict]:
+    """Get latest news dari Finnhub (forex/gold/economy category).
+    Returns: list of {headline, summary, source, datetime, related}.
+    """
+    if not api_key:
+        return []
+    data = _finnhub_get("news", api_key, category=category)
+    if not isinstance(data, list):
+        return []
+    return [{
+        "headline": item.get("headline", ""),
+        "summary": item.get("summary", "")[:200],
+        "source": item.get("source", ""),
+        "datetime": item.get("datetime", 0),
+        "related": item.get("related", ""),
+    } for item in data[:5]]
+
+
+def is_high_impact_news_soon(api_key: str = "", minutes: int = 30) -> tuple[bool, str]:
+    """Cek apakah ada high-impact news dalam X menit ke depan.
+
+    Returns: (is_soon, event_description)
+    """
+    # Pakai ForexFactory (lebih reliable untuk forex)
+    events = fetch_forexfactory_calendar()
+    now = datetime.now(timezone.utc)
+
+    for ev in events:
+        try:
+            ev_time = datetime.strptime(f"{now.strftime('%Y-%m-%d')} {ev['time_utc']}", "%Y-%m-%d %H:%M")
+            ev_time = ev_time.replace(tzinfo=timezone.utc)
+            diff_min = (ev_time - now).total_seconds() / 60
+            if 0 <= diff_min <= minutes:
+                return True, f"{ev['currency']} {ev['event']} dalam {int(diff_min)} menit"
+        except Exception:
+            continue
+    return False, ""

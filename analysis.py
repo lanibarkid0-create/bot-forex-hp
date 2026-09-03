@@ -100,7 +100,8 @@ KILLZONES = {
 _SESSION = requests.Session()
 _SESSION.headers.update({"User-Agent": "forex-bot/1.0"})
 # Connection pool: reuse TCP connection untuk speed
-adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10)
+# Max ~20 koneksi paralel (6 TF + 8 currency strength + slack)
+adapter = requests.adapters.HTTPAdapter(pool_connections=30, pool_maxsize=30)
 _SESSION.mount("https://", adapter)
 
 # === CANDLE CACHE (TTL 60 detik) ===

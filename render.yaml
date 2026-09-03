@@ -1,5 +1,5 @@
 services:
-  - type: worker
+  - type: web
     name: ai-bedah-chart-bot
     runtime: docker
     plan: free
@@ -8,6 +8,8 @@ services:
       - key: TELEGRAM_BOT_TOKEN
         sync: false  # Set manual di Render dashboard (secret)
       - key: TWELVEDATA_API_KEY
+        sync: false  # Set manual di Render dashboard (secret)
+      - key: FINNHUB_API_KEY
         sync: false  # Set manual di Render dashboard (secret)
       - key: PORT
         value: 8080

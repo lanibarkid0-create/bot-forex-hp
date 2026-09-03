@@ -32,6 +32,7 @@ from fundamental import (
     calc_currency_strength, strength_label, strength_emoji,
     get_pair_interest_diff,
 )
+from signal_analyzer import generate_signal, format_signal_json
 
 # === Conversation states ===
 STATE_CHOOSE_MODE, STATE_CHOOSE_TF = range(2)
@@ -40,6 +41,7 @@ load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "")
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO
@@ -317,10 +319,63 @@ Tambahkan mode di akhir command:
     await update.message.reply_text(text, parse_mode="HTML")
 
 
-# === INTERACTIVE FLOW: SYMBOL → MODE → TF → ANALISA ===
+async def cmd_signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Generate JSON trading signal (SMC + fundamental + orderflow).
+
+    Usage: /signal XAUUSD M3
+    Optional: /signal XAUUSD  (default M3 scalping)
+    """
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Format: <code>/signal SYMBOL [TF]</code>\n"
+            "Contoh:\n"
+            "• <code>/signal XAUUSD M3</code> — gold scalping\n"
+            "• <code>/signal EURUSD M5</code> — forex scalping\n"
+            "• <code>/signal GBPUSD M15</code> — intraday\n\n"
+            "<i>Output JSON dengan entry, SL, TP, confidence score.</i>",
+            parse_mode="HTML"
+        )
+        return
+
+    symbol = args[0].upper()
+    timeframe = args[1].upper() if len(args) > 1 else "M3"
+
+    status_msg = await update.message.reply_text(
+        f"⏳ Generating signal <b>{symbol} {timeframe}</b>...\n\n"
+        f"<i>Fetch candle + DXY + US10Y + VIX + news...</i>",
+        parse_mode="HTML"
+    )
+
+    try:
+        signal = generate_signal(
+            api_key=TWELVEDATA_API_KEY,
+            finnhub_key=FINNHUB_API_KEY,
+            symbol=symbol,
+            timeframe=timeframe,
+        )
+        text = format_signal_json(signal)
+        # Telegram max message 4096 char → split kalau perlu
+        if len(text) <= 4000:
+            # Wrap di code block biar monospace
+            await status_msg.edit_text(f"```json\n{text}\n```", parse_mode="Markdown")
+        else:
+            # Kirim sebagai file
+            from io import BytesIO
+            bio = BytesIO(text.encode())
+            bio.name = f"signal_{symbol}_{timeframe}.json"
+            await status_msg.delete()
+            await context.bot.send_document(
+                chat_id=update.effective_chat.id,
+                document=bio,
+                caption=f"📊 Signal {symbol} {timeframe} — {signal['signal']} (conf {signal['confidence']})"
+            )
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Error: {e}")
+
 
 def _mode_keyboard(symbol: str, tf: str | None = None) -> InlineKeyboardMarkup:
-    """Tombol pilihan mode trading."""
+    """Tombol pilihan mode trading (Scalping/Intraday/Swing)."""
     tf_part = f"_{tf}" if tf else ""
     return InlineKeyboardMarkup([
         [
@@ -578,6 +633,7 @@ def main():
     app.add_handler(CommandHandler("analyze", cmd_analyze))
     app.add_handler(CommandHandler("analisa", cmd_analyze))  # ID alias
     app.add_handler(CommandHandler("mode", cmd_mode))
+    app.add_handler(CommandHandler("signal", cmd_signal))
 
     # === Interactive flow: callback dari inline button ===
     app.add_handler(CallbackQueryHandler(on_mode_click, pattern=r"^mode:"))
