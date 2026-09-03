@@ -79,56 +79,30 @@ if [ "$USE_SYSTEMD" = "1" ]; then
     systemctl --user status ai-bedah-chart.service --no-pager | head -20
 fi
 
-# 5. Setup crontab fallback (ALWAYS, sebagai backup)
+# 5. Setup crontab fallback hanya jika systemd tidak tersedia
 echo ""
-echo "🔧 Setting up crontab @reboot fallback..."
-
-# Kill existing bot
-pkill -9 -f "python3 bot.py" 2>/dev/null || true
-pkill -9 -f "watch_loop" 2>/dev/null || true
-sleep 2
-
-# Tambah crontab entries (no duplicate)
-CRON_LINE="@reboot sleep 30 && /home/lani/Dokumen/bot-forex/auto_start.sh >> /home/lani/Dokumen/bot-forex/bot.log 2>&1"
-CRON_WATCH="@reboot sleep 60 && /home/lani/Dokumen/bot-forex/watch_loop.sh >> /home/lani/Dokumen/bot-forex/watch.log 2>&1"
-
-# Backup crontab
-crontab -l > /tmp/cron.bak 2>/dev/null || true
-
-# Hapus entry lama kalau ada
-crontab -l 2>/dev/null | grep -v "auto_start.sh\|watch_loop.sh" > /tmp/cron.new || true
-
-# Tambah entry baru
-echo "$CRON_LINE" >> /tmp/cron.new
-echo "$CRON_WATCH" >> /tmp/cron.new
-crontab /tmp/cron.new
-rm /tmp/cron.new
-
-echo "✅ crontab installed"
-
-# 6. Start sekarang
-echo ""
-echo "🚀 Starting bot now..."
-if [ "$USE_VENV" = "1" ] && [ -x .venv/bin/python ]; then
-    nohup .venv/bin/python bot.py > bot.log 2>&1 &
+if [ "$USE_SYSTEMD" = "1" ]; then
+    echo "✅ systemd menangani auto-start dan auto-restart"
+    systemctl --user is-active --quiet ai-bedah-chart.service
+    echo "✅ Bot RUNNING via systemd"
 else
+    echo "🔧 Setting up crontab @reboot fallback..."
+    CRON_LINE="@reboot sleep 30 && /home/lani/Dokumen/bot-forex/auto_start.sh >> /home/lani/Dokumen/bot-forex/bot.log 2>&1"
+    CRON_WATCH="@reboot sleep 60 && /home/lani/Dokumen/bot-forex/watch_loop.sh >> /home/lani/Dokumen/bot-forex/watch.log 2>&1"
+    crontab -l 2>/dev/null | grep -v "auto_start.sh\|watch_loop.sh" > /tmp/cron.new || true
+    echo "$CRON_LINE" >> /tmp/cron.new
+    echo "$CRON_WATCH" >> /tmp/cron.new
+    crontab /tmp/cron.new
+    rm /tmp/cron.new
+    echo "✅ crontab installed"
+
+    echo "🚀 Starting bot now..."
     nohup python3 bot.py > bot.log 2>&1 &
-fi
-sleep 4
-
-# 7. Verify
-if pgrep -f "python3 bot.py" > /dev/null; then
+    sleep 4
+    pgrep -f "python3 bot.py" > /dev/null
     echo "✅ Bot RUNNING!"
-    echo ""
-    echo "📱 Test di Telegram: chat @lani1_bot, kirim /start"
-    echo ""
-    echo "📌 Perintah berguna:"
-    echo "   ./restart.sh         # restart manual"
-    echo "   ./status.sh          # cek status"
-    echo "   tail -f bot.log      # lihat log real-time"
-    echo "   systemctl --user status ai-bedah-chart   # cek systemd"
-else
-    echo "❌ Bot GAGAL start. Cek log:"
-    tail -20 bot.log
-    exit 1
 fi
+
+echo ""
+echo "📱 Test di Telegram: chat @lani1_bot, kirim /start"
+echo "📌 Cek status: systemctl --user status ai-bedah-chart.service"
