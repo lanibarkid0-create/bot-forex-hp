@@ -129,17 +129,50 @@ def parse_user_input(text: str) -> tuple[str, str] | None:
 
 
 def fetch_candles(api_key: str, symbol: str, interval: str, limit: int = 200,
-                   max_retries: int = 3) -> pd.DataFrame:
-    """Fetch candle dari Twelve Data dengan cache + retry + rate-limit handling.
+                   max_retries: int = 3,
+                   alpha_vantage_key: str = "") -> pd.DataFrame:
+    """Fetch candle dengan multi-provider fallback (TwelveData → Alpha Vantage).
 
-    Free tier: 8 API credits/menit. Retry otomatis kalau kena rate limit.
+    Free tier:
+      - TwelveData: 800 credits/hari
+      - Alpha Vantage: 25 req/hari
+    Retry otomatis kalau kena rate limit.
     """
-    cache_key = (api_key[:8], symbol, interval, limit)
+    from data_providers import fetch_with_fallback
+    cache_key = (api_key[:8], alpha_vantage_key[:8], symbol, interval, limit)
     now = time.time()
     cached = _CANDLE_CACHE.get(cache_key)
     if cached and now - cached[0] < _CACHE_TTL:
         return cached[1].copy()
 
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            df, provider = fetch_with_fallback(
+                symbol=symbol, interval=interval, limit=limit,
+                twelvedata_key=api_key, alpha_vantage_key=alpha_vantage_key,
+            )
+            if df is not None and len(df) > 0:
+                _CANDLE_CACHE[cache_key] = (now, df)
+                return df.copy()
+            last_error = f"{provider}: no data"
+            # Daily quota / out of credits → stop retry, akan reset besok
+            if "out of api credits" in last_error.lower() or "daily" in last_error.lower():
+                raise RuntimeError(f"{provider} daily limit habis: {last_error}")
+            time.sleep(2 ** attempt)
+            continue
+        except Exception as e:
+            last_error = str(e)
+            if "daily limit" in str(e).lower():
+                raise
+            time.sleep(2 ** attempt)
+            continue
+    raise RuntimeError(f"Fetch gagal setelah {max_retries} attempt: {last_error}")
+
+
+def _legacy_twelvedata_block(api_key: str, symbol: str, interval: str, limit: int,
+                              max_retries: int = 3) -> pd.DataFrame:
+    """Legacy single-provider fetch (kept for reference)."""
     url = "https://api.twelvedata.com/time_series"
     params = {
         "symbol": symbol, "interval": interval, "outputsize": limit,
@@ -156,7 +189,10 @@ def fetch_candles(api_key: str, symbol: str, interval: str, limit: int = 200,
             if data.get("status") == "error":
                 msg = data.get("message", "API error")
                 last_error = msg
-                # Rate limit → tunggu 60 detik
+                # Daily quota habis (out of API credits) → stop, jangan retry
+                if "out of api credits" in msg.lower() or "daily" in msg.lower():
+                    raise RuntimeError(f"TwelveData daily limit habis: {msg}")
+                # Rate limit per-minute → tunggu 60 detik lalu retry
                 if "credits" in msg.lower() or "rate" in msg.lower() or "limit" in msg.lower():
                     wait = 60
                     time.sleep(wait)
