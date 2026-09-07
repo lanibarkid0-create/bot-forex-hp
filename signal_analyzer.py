@@ -174,19 +174,24 @@ def generate_signal(api_key: str, finnhub_key: str, symbol: str, timeframe: str 
     tf_limit = 200
     m15_limit = 100
 
+    import sys, time as _t
     fetched = {}
+    _t0 = _t.time()
     with ThreadPoolExecutor(max_workers=3) as ex:
         futures = {
             ex.submit(fetch_candles, api_key, td_sym, "1h", h1_limit): "h1",
             ex.submit(fetch_candles, api_key, td_sym, td_tf, tf_limit): "tf",
             ex.submit(fetch_candles, api_key, td_sym, "15min", m15_limit): "m15",
         }
-        for fut in as_completed(futures):
+        for fut in as_completed(futures, timeout=30):
             key = futures[fut]
             try:
                 fetched[key] = fut.result()
-            except Exception:
+                print(f"  [signal] {key} OK", flush=True)
+            except Exception as e:
                 fetched[key] = None
+                print(f"  [signal] {key} FAIL: {e}", flush=True)
+        print(f"  [signal] fetch {_t.time()-_t0:.1f}s", flush=True)
 
     df_h1 = fetched.get("h1")
     df_tf = fetched.get("tf")
