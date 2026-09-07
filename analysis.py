@@ -104,9 +104,19 @@ _SESSION.headers.update({"User-Agent": "forex-bot/1.0"})
 adapter = requests.adapters.HTTPAdapter(pool_connections=30, pool_maxsize=30)
 _SESSION.mount("https://", adapter)
 
-# === CANDLE CACHE (TTL 60 detik) ===
+# === CANDLE CACHE (adaptive TTL: HTF lebih lama) ===
+# LTF (M5/M15/M30) candle baru tiap 5-15 menit → TTL 60s cukup
+# MTF (H1) candle baru tiap 1 jam → TTL 5 menit
+# HTF (H4/D1) candle baru tiap hari → TTL 30 menit
 _CANDLE_CACHE: dict[tuple, tuple[float, "pd.DataFrame"]] = {}
-_CACHE_TTL = 60  # seconds
+
+def _cache_ttl_for(interval: str) -> int:
+    """Adaptive TTL berdasarkan timeframe."""
+    if interval in ("4h", "1day"):
+        return 1800        # 30 menit
+    if interval in ("1h", "2h"):
+        return 300         # 5 menit
+    return 60             # 1 menit (M5/M15/M30)
 
 # === NEWS DATES (high-impact events) ===
 # Format: (date_str, time_utc, event, currency)
@@ -142,7 +152,8 @@ def fetch_candles(api_key: str, symbol: str, interval: str, limit: int = 200,
     cache_key = (api_key[:8], alpha_vantage_key[:8], symbol, interval, limit)
     now = time.time()
     cached = _CANDLE_CACHE.get(cache_key)
-    if cached and now - cached[0] < _CACHE_TTL:
+    ttl = _cache_ttl_for(interval)
+    if cached and now - cached[0] < ttl:
         return cached[1].copy()
 
     last_error = None
@@ -639,24 +650,23 @@ def analyze_full(api_key: str, symbol: str, timeframe: str = "M5", mode: str = "
     td_sym = SYMBOL_MAP.get(symbol.upper(), symbol)
     td_tf = TF_MAP.get(timeframe, "5min")
 
-    # === MULTI-TIMEFRAME FETCH (parallel 3 workers, ~1.5s total) ===
-    # HTF (D1, H4) → trend utama
-    # MTF (H1, M30) → pullback zone
-    # LTF (M15) → struktur
-    # Entry TF (M5) → konfirmasi rejection
+    # === MULTI-TIMEFRAME FETCH (parallel, ~1-1.5s total) ===
+    # Tetap fetch 7 TF untuk voting logic, tapi:
+    # - limit lebih kecil untuk HTF (candle lama gak perlu)
+    # - max_workers dinaikkan dari 3→5 untuk paralel lebih agresif
+    # - delay dikurangi (cache akan handle de-dup di request yang sama)
     specs = [
         (td_tf, 200),     # Entry TF
         ("5min", 200),    # M5 confirmation
         ("15min", 200),   # M15 structure
         ("30min", 200),   # M30 pullback
         ("1h", 200),      # H1 bias
-        ("4h", 100),      # H4 trend
-        ("1day", 100),    # D1 trend utama
+        ("4h", 100),      # H4 trend (limit kecil cukup)
+        ("1day", 50),     # D1 trend utama (limit kecil banget cukup)
     ]
     try:
-        # Parallel 3 workers → 6 req paralel selesai dalam ~1.5s
-        # 3 worker aman untuk free tier (8/menit, max burst ~6 dalam sekejap OK)
-        fetched = fetch_candles_parallel(api_key, td_sym, specs, max_workers=3, delay=0.2)
+        # 5 worker paralel: lebih agresif, aman karena ada retry + cache
+        fetched = fetch_candles_parallel(api_key, td_sym, specs, max_workers=5, delay=0.1)
     except SymbolPlanError as e:
         raise SymbolPlanError(symbol, f"'{symbol}' butuh plan Grow/Venture di TwelveData. Coba pair forex (EURUSD, XAUUSD) yang free.")
     except SymbolNotFoundError as e:
@@ -672,6 +682,9 @@ def analyze_full(api_key: str, symbol: str, timeframe: str = "M5", mode: str = "
     if df is None or df_m5 is None or df_m15 is None or df_h1 is None or df_h4 is None or df_d1 is None:
         failed = [tf for tf, df_v in zip([td_tf, "5min", "15min", "30min", "1h", "4h", "1day"], [df, df_m5, df_m15, df_m30, df_h1, df_h4, df_d1]) if df_v is None]
         raise RuntimeError(f"Gagal fetch {symbol} di TF: {', '.join(failed)}")
+    # Fallback: kalau M30 gagal, pakai H1 (mirip time horizon)
+    if df_m30 is None:
+        df_m30 = df_h1
 
     price = float(df["close"].iloc[-1])
 
