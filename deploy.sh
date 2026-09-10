@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================
-# AI BEDAH CHART - Deploy ke GitHub + Render
+# AI BEDAH CHART - Deploy ke GitHub + Railway
 # ============================================
 # Usage: ./deploy.sh
 # Syarat: git installed, sudah login GitHub
@@ -63,15 +63,10 @@ echo ""
 echo "✅ Selesai! Code sudah di GitHub."
 echo ""
 echo "=============================================="
-echo "📌 LANGKAH SELANJUTNYA (deploy ke Render):"
+echo "📌 Railway akan auto-deploy dari branch main:"
 echo "=============================================="
-echo "1. Buka https://render.com → Sign up dengan GitHub"
-echo "2. Klik 'New +' → 'Blueprint'"
-echo "3. Pilih repo 'bot-forex' kamu"
-echo "4. Render otomatis baca render.yaml"
-echo "5. Isi Environment Variables:"
-echo "   • TELEGRAM_BOT_TOKEN = (dari .env)"
-echo "   • TWELVEDATA_API_KEY = (dari .env)"
-echo "6. Klik 'Apply' → tunggu 2-3 menit"
-echo "7. Bot LIVE 24/7! 🎉"
+echo "1. Push ini memicu Railway otomatis build dan deploy"
+echo "2. Pantau deployment di dashboard Railway → Deployments"
+echo "3. Pastikan Variables Railway sudah berisi token API"
+echo "4. Bot LIVE setelah deployment selesai! 🎉"
 echo ""
