@@ -646,26 +646,14 @@ def main():
     app.add_error_handler(on_error)
     log.info("AI BEDAH CHART berjalan... (interactive mode)")
 
-    # === Run polling dengan auto-retry kalau koneksi putus ===
-    import time as _time
-    while True:
-        try:
-            app.run_polling(
-                drop_pending_updates=True,
-                allowed_updates=["message", "callback_query"],
-                poll_interval=2.0,      # jeda antar poll
-                timeout=30,             # long polling timeout
-                bootstrap_retries=5,    # retry saat startup
-            )
-            break  # normal exit
-        except KeyboardInterrupt:
-            log.info("Dihentikan manual")
-            break
-        except Exception as e:
-            log.error(f"Polling crash: {e}. Restart dalam 10 detik...")
-            _time.sleep(10)
-            # continue loop → restart polling
-            continue
+    # Service manager menangani restart agar event loop selalu dibuat ulang.
+    app.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=["message", "callback_query"],
+        poll_interval=2.0,
+        timeout=30,
+        bootstrap_retries=5,
+    )
 
 
 if __name__ == "__main__":
